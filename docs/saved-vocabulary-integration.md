@@ -489,6 +489,197 @@ Sem essa proteção, pausar um áudio antigo ao avançar para a próxima pergunt
 pode ser interpretado como falha do Google e iniciar inesperadamente o TTS do
 navegador.
 
+## Ações ao selecionar texto: definição, tradução e áudio
+
+Além de salvar a seleção, outras aplicações podem oferecer três ações no
+mesmo menu flutuante:
+
+```html
+<div id="selection-actions" hidden role="toolbar"
+     aria-label="Ações para o texto selecionado">
+  <button type="button" id="save-selection">＋ Salvar</button>
+  <button type="button" id="define-selection">Definição</button>
+  <button type="button" id="translate-selection">Traduzir</button>
+  <button type="button" id="listen-selection">Ouvir</button>
+</div>
+```
+
+O menu deve guardar a seleção normalizada em estado compartilhado. O fluxo de
+seleção deve aceitar somente texto da área de estudo, limitar o tamanho máximo
+e usar `textContent` para apresentar o termo:
+
+```javascript
+function selectedText() {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount !== 1 || selection.isCollapsed) return "";
+
+  const range = selection.getRangeAt(0);
+  const start = range.startContainer.nodeType === Node.ELEMENT_NODE
+    ? range.startContainer
+    : range.startContainer.parentElement;
+  const end = range.endContainer.nodeType === Node.ELEMENT_NODE
+    ? range.endContainer
+    : range.endContainer.parentElement;
+
+  if (!start?.closest("main .paragraph-text")
+      || !end?.closest("main .paragraph-text")) return "";
+
+  const text = normalizeText(selection.toString());
+  return text.length > 0 && text.length <= 500 ? text : "";
+}
+
+function scheduleSelectionMenu() {
+  clearTimeout(selectionTimer);
+  selectionTimer = setTimeout(() => {
+    const text = selectedText();
+    selectionState = text;
+    document.querySelector("#selection-actions").hidden = !text;
+  }, 150);
+}
+
+document.addEventListener("selectionchange", scheduleSelectionMenu);
+document.addEventListener("mouseup", scheduleSelectionMenu);
+document.addEventListener("touchend", scheduleSelectionMenu);
+```
+
+Para touch, posicione o menu fixo na parte inferior da viewport; para desktop,
+posicione-o perto do `Range.getBoundingClientRect()`. No `pointerdown` do menu,
+use `preventDefault()` para não perder a seleção antes do clique:
+
+```javascript
+document.querySelector("#selection-actions")
+  .addEventListener("pointerdown", event => event.preventDefault());
+```
+
+### Definição no Ordnet
+
+O `ordnet.dk` não oferece uma API pública CORS estável para chamadas
+programáticas. Portanto, a definição deve abrir diretamente a busca do termo
+em uma nova aba:
+
+```javascript
+function ordnetUrl(term) {
+  return "https://ordnet.dk/ddo/ordbog?query="
+    + encodeURIComponent(term);
+}
+
+document.querySelector("#define-selection").addEventListener("click", () => {
+  const term = selectionState || selectedText();
+  if (!term) return;
+
+  document.querySelector("#selection-actions").hidden = true;
+  window.open(ordnetUrl(term), "_blank", "noopener,noreferrer");
+});
+```
+
+Não tente fazer `fetch` do Ordnet a partir de uma página estática: a ausência de
+CORS e possíveis mudanças no HTML tornam essa integração frágil. O uso de
+`encodeURIComponent` é obrigatório para preservar `æ`, `ø`, `å`, espaços e
+acentos na URL.
+
+### Tradução inline
+
+Para traduzir diretamente no diálogo, o leitor pode usar o endpoint público
+compatível com CORS do Google Translate:
+
+```javascript
+async function translateDanishToPortuguese(term, signal) {
+  const params = new URLSearchParams({
+    client: "gtx",
+    sl: "da",
+    tl: "pt",
+    dt: "t",
+    q: term,
+  });
+  const response = await fetch(
+    `https://translate.googleapis.com/translate_a/single?${params}`,
+    { signal }
+  );
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+  const data = await response.json();
+  const translation = Array.isArray(data[0])
+    ? data[0].map(part => Array.isArray(part) ? part[0] : "").join("")
+    : "";
+  if (!translation) throw new Error("Tradução indisponível");
+  return translation;
+}
+```
+
+O parâmetro `q` deve ser enviado por `URLSearchParams`; não monte a URL
+concatenando o termo manualmente. Isso evita corrupção de palavras como
+`øst`, `førte` e `især`.
+
+O diálogo precisa:
+
+1. mostrar o termo selecionado com `textContent`;
+2. exibir um estado de carregamento;
+3. exibir a tradução ou uma mensagem de erro;
+4. oferecer um link para o site do Google Tradutor como comparação;
+5. cancelar a requisição anterior quando uma nova seleção for consultada.
+
+Use `AbortController` e um ticket de requisição para impedir que uma resposta
+antiga sobrescreva a seleção atual:
+
+```javascript
+let languageTicket = 0;
+let languageAbort;
+
+async function openTranslationDialog() {
+  const term = selectionState || selectedText();
+  if (!term) return;
+
+  const ticket = ++languageTicket;
+  languageAbort?.abort();
+  languageAbort = new AbortController();
+  showTranslationLoading(term);
+
+  try {
+    const translation = await translateDanishToPortuguese(
+      term,
+      languageAbort.signal
+    );
+    if (ticket !== languageTicket) return;
+    showTranslationResult(term, translation);
+  } catch (error) {
+    if (ticket === languageTicket && error.name !== "AbortError") {
+      showTranslationError(term);
+    }
+  }
+}
+
+document.querySelector("#translate-selection")
+  .addEventListener("click", openTranslationDialog);
+```
+
+O endpoint é público e não oficial; não coloque chaves secretas no HTML ou
+JavaScript. Para requisitos de produção, substitua-o por Google Cloud
+Translation, Azure Translator ou outro serviço oficial através de um backend
+ou função serverless.
+
+### Ouvir a seleção
+
+Se a aplicação já possui `window.studyTts.play`, reutilize-o em vez de criar
+um segundo player. Para garantir que a ação use o endpoint Google TTS, force o
+engine para `google` antes de reproduzir:
+
+```javascript
+document.querySelector("#listen-selection").addEventListener("click", () => {
+  const term = selectionState || selectedText();
+  if (!term) return;
+
+  // Não esconda o menu: o usuário pode repetir o áudio.
+  window.studyTts.configure({ engine: "google" });
+  window.studyTts.play(term);
+});
+```
+
+O TTS deve construir a URL com `URLSearchParams`, definir
+`referrerPolicy = "no-referrer"` antes de atribuir `src` e tratar falhas,
+cancelamentos e fallback para `speechSynthesis`. Para uma seleção longa,
+reutilize a divisão em partes de até aproximadamente 180 caracteres já usada
+pelo leitor.
+
 ## Checklist de integração
 
 - [ ] Firebase App, Auth e Firestore carregados antes dos scripts da aplicação.
@@ -506,6 +697,13 @@ navegador.
 - [ ] Exercício usa `subject: "custom"`.
 - [ ] TTS usa `no-referrer`.
 - [ ] Fallback do TTS ignora `AbortError` e requests obsoletas.
+- [ ] Menu de seleção contém `Salvar`, `Definição`, `Traduzir` e `Ouvir`.
+- [ ] Definição usa `encodeURIComponent` e abre o Ordnet em nova aba.
+- [ ] Tradução usa `URLSearchParams` e preserva `æ`, `ø`, `å` e acentos.
+- [ ] Tradução cancela requisições antigas com `AbortController`.
+- [ ] Tradução usa `textContent`, nunca HTML não confiável.
+- [ ] Ouvir reutiliza o TTS existente e mantém o menu aberto.
+- [ ] Endpoints públicos são documentados como não oficiais e sem chaves.
 - [ ] Teste realizado no domínio publicado, não apenas com arquivo local.
 - [ ] Cache busting aplicado quando scripts estáticos forem alterados.
 
